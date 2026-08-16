@@ -1,0 +1,56 @@
+{
+  "name": "@q1-digital/inference-gateway",
+  "version": "0.1.0",
+  "description": "Multi-provider LLM inference routing with circuit breakers, cost-aware load balancing, and OpenTelemetry observability",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/index.ts",
+    "test": "vitest",
+    "test:coverage": "vitest --coverage",
+    "lint": "eslint src/ --ext .ts",
+    "format": "prettier --write 'src/**/*.ts'",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "llm",
+    "inference",
+    "gateway",
+    "openai",
+    "anthropic",
+    "groq",
+    "circuit-breaker",
+    "load-balancer",
+    "streaming",
+    "opentelemetry",
+    "typescript"
+  ],
+  "author": "Marcio Krefta <q1digitalfreela@gmail.com>",
+  "license": "MIT",
+  "dependencies": {
+    "@opentelemetry/api": "^1.8.0",
+    "@opentelemetry/sdk-node": "^0.49.0",
+    "@opentelemetry/sdk-trace-base": "^1.22.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.49.0",
+    "@opentelemetry/exporter-metrics-otlp-http": "^0.49.0",
+    "openai": "^4.52.0",
+    "@anthropic-ai/sdk": "^0.24.0",
+    "groq-sdk": "^0.5.0",
+    "zod": "^3.23.0",
+    "pino": "^9.1.0",
+    "eventemitter3": "^5.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.0",
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0",
+    "@vitest/coverage-v8": "^1.6.0",
+    "tsx": "^4.10.0",
+    "eslint": "^9.3.0",
+    "prettier": "^3.2.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
