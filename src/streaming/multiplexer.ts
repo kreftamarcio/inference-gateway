@@ -67,11 +67,35 @@ export class StreamMultiplexer {
 
     const startTime = performance.now();
     const buffer: StreamChunk[] = [];
-    let lastChunkTime = Date.now();
+    
+    // [Passo Ãšnico] Keep-Alive AssÃ­ncrono (Cloud Timeout Fix)
+    const channel = new StreamChannel<StreamChunk>();
+    const keepAliveInterval = Math.max(1000, Math.floor(idleTimeout / 2));
+    const timer = setInterval(() => {
+      // Injeta um chunk vazio para manter o TCP/LB ativo
+      channel.push({ delta: '', metadata: { keepAlive: true } });
+    }, keepAliveInterval);
+
+    // Produtor
+    (async () => {
+      try {
+        for await (const chunk of source) {
+          channel.push(chunk);
+        }
+      } catch (e) {
+        channel.error(e as Error);
+      } finally {
+        channel.close();
+      }
+    })();
 
     try {
-      for await (const chunk of source) {
-        lastChunkTime = Date.now();
+      for await (const chunk of channel) {
+        if (chunk.metadata?.keepAlive) {
+          yield chunk; // Emite imediatamente o keep-alive
+          continue;
+        }
+
         metrics.chunksReceived++;
         metrics.bytesReceived += chunk.delta.length;
 
@@ -79,7 +103,7 @@ export class StreamMultiplexer {
           metrics.firstChunkLatency = performance.now() - startTime;
         }
 
-        // Backpressure: if buffer is full, yield accumulated chunks first
+        // Backpressure
         if (buffer.length >= highWaterMark) {
           metrics.backpressureEvents++;
           for (const buffered of buffer.splice(0)) {
@@ -95,6 +119,7 @@ export class StreamMultiplexer {
         yield buffered;
       }
     } finally {
+      clearInterval(timer);
       metrics.totalDuration = performance.now() - startTime;
     }
   }
