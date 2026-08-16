@@ -5,93 +5,98 @@
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.4-blue.svg)](https://www.typescriptlang.org/)
 [![Node.js](https://img.shields.io/badge/Node.js-20+-green.svg)](https://nodejs.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Status: WIP](https://img.shields.io/badge/status-work%20in%20progress-orange.svg)](#project-status)
+
+## Project Status
+
+**Work in progress.** The architecture and core modules (routing, circuit breaker, cost engine) are implemented. Provider adapters and the telemetry exporter are in development. No published benchmarks yet: the Performance Targets section below states design goals, not measured results.
+
+## Problem
+
+Running LLMs in production against a single provider is fragile:
+
+- **Outages cascade.** When OpenAI degrades, your product degrades with it.
+- **Costs are opaque.** Token spend is invisible until the invoice arrives.
+- **Model choice is static.** A trivial classification call hits the same expensive model as a complex reasoning task.
+- **Rate limits are hard walls.** No graceful degradation, just 429s.
+
+This gateway sits between your application and every LLM provider, making provider choice a runtime decision based on health, cost, and latency.
 
 ## Architecture
 
+```mermaid
+flowchart TD
+    A[Client Request] --> B[Request Interceptor]
+    B --> B1[Auth]
+    B --> B2[Rate Limiter]
+    B --> B3[Schema Validator]
+    B --> B4[Budget Guard]
+
+    B1 & B2 & B3 & B4 --> C{Router Core}
+
+    C --> C1[Latency Scoring]
+    C --> C2[Cost Scoring]
+    C --> C3[Capability Match]
+
+    C1 & C2 & C3 --> D[Provider Pool]
+
+    D --> P1[OpenAI + CB]
+    D --> P2[Anthropic + CB]
+    D --> P3[Google + CB]
+    D --> P4[Groq + CB]
+
+    P1 & P2 & P3 & P4 --> E[Streaming Multiplexer]
+
+    E --> E1[SSE / WS Adapter]
+    E --> E2[Backpressure Control]
+    E --> E3[Token Accumulator]
+
+    E1 & E2 & E3 --> F[Observability Layer]
+    F --> F1[OTel Traces]
+    F --> F2[OTel Metrics]
+    F --> F3[Structured Logs]
+
+    F --> G[Client Response]
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    Client Request                         │
-└─────────────────────┬───────────────────────────────────┘
-                      │
-┌─────────────────────▼───────────────────────────────────┐
-│              Request Interceptor                         │
-│  ┌─────────┐ ┌──────────┐ ┌───────────┐ ┌───────────┐  │
-│  │  Auth   │ │  Rate    │ │  Request  │ │  Budget   │  │
-│  │  Layer  │ │  Limiter │ │  Validator│ │  Guard    │  │
-│  └─────────┘ └──────────┘ └───────────┘ └───────────┘  │
-└─────────────────────┬───────────────────────────────────┘
-                      │
-┌─────────────────────▼───────────────────────────────────┐
-│                  Router Core                             │
-│  ┌──────────────────────────────────────────────────┐   │
-│  │           Cost-Aware Load Balancer                │   │
-│  │  ┌────────┐ ┌────────┐ ┌────────┐ ┌──────────┐  │   │
-│  │  │Latency │ │ Cost   │ │Quality │ │Throughput│  │   │
-│  │  │Scoring │ │Scoring │ │Scoring │ │ Scoring  │  │   │
-│  │  └────────┘ └────────┘ └────────┘ └──────────┘  │   │
-│  └──────────────────────────────────────────────────┘   │
-└─────────────────────┬───────────────────────────────────┘
-                      │
-┌─────────────────────▼───────────────────────────────────┐
-│              Provider Pool                               │
-│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐   │
-│  │ OpenAI   │ │Anthropic │ │  Google  │ │  Groq    │   │
-│  │          │ │          │ │  Gemini  │ │          │   │
-│  │ ┌──────┐ │ │ ┌──────┐ │ │ ┌──────┐ │ │ ┌──────┐ │   │
-│  │ │Circuit│ │ │ │Circuit│ │ │ │Circuit│ │ │ │Circuit│ │   │
-│  │ │Breaker│ │ │ │Breaker│ │ │ │Breaker│ │ │ │Breaker│ │   │
-│  │ └──────┘ │ │ └──────┘ │ │ └──────┘ │ │ └──────┘ │   │
-│  └──────────┘ └──────────┘ └──────────┘ └──────────┘   │
-└─────────────────────┬───────────────────────────────────┘
-                      │
-┌─────────────────────▼───────────────────────────────────┐
-│            Streaming Multiplexer                         │
-│  ┌─────────────┐ ┌──────────────┐ ┌─────────────────┐   │
-│  │  SSE/WS     │ │  Backpressure│ │  Token Counter  │   │
-│  │  Adapter    │ │  Controller  │ │  & Accumulator  │   │
-│  └─────────────┘ └──────────────┘ └─────────────────┘   │
-└─────────────────────┬───────────────────────────────────┘
-                      │
-┌─────────────────────▼───────────────────────────────────┐
-│              Observability Layer                          │
-│  ┌───────────┐ ┌───────────┐ ┌────────────────────────┐ │
-│  │  Traces   │ │  Metrics  │ │  Structured Logging    │ │
-│  │  (OTel)   │ │  (OTel)   │ │  (Pino)               │ │
-│  └───────────┘ └───────────┘ └────────────────────────┘ │
-└─────────────────────────────────────────────────────────┘
+
+### Circuit Breaker State Machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> CLOSED
+    CLOSED --> OPEN: failures >= threshold<br/>within monitor window
+    OPEN --> HALF_OPEN: recovery timeout elapsed
+    HALF_OPEN --> CLOSED: successThreshold<br/>consecutive successes
+    HALF_OPEN --> OPEN: any failure during probe
+    CLOSED --> CLOSED: success (no state change)
 ```
 
 ## Features
 
-### Multi-Provider Routing
-- **Weighted round-robin** with health-aware promotion/demotion
-- **Least-latency** routing based on rolling P95 windows
-- **Cost-optimized** routing with per-model token pricing
-- **Capability-based** routing (vision, function calling, long context)
+### Routing Strategies
+
+| Strategy | Selection Criterion | Best For |
+|----------|--------------------|----------|
+| `round-robin` | Weighted rotation across healthy providers | Even load distribution |
+| `least-latency` | Lowest rolling P95 latency | Interactive UX |
+| `cost-optimized` | Lowest blended token price | Batch / background jobs |
+| `capability-based` | Required features (vision, tools, context length) | Mixed workloads |
 
 ### Circuit Breaker (per provider)
-- Three states: `CLOSED` → `OPEN` → `HALF_OPEN`
-- Configurable failure threshold, recovery timeout, and success threshold
-- Exponential backoff on repeated failures
-- Health probe during half-open state
+
+Three-state machine with configurable thresholds. Failures are counted within a rolling monitor window, so a burst of errors an hour ago doesn't keep the circuit open. During `HALF_OPEN`, a limited number of probe requests test recovery, and any failure immediately reopens the circuit.
 
 ### Streaming Multiplexer
-- Unified SSE/WebSocket interface regardless of provider protocol
-- Token-level streaming with backpressure control
-- Automatic reconnection with resume tokens
-- Client-side buffering with configurable flush intervals
+
+Providers expose different streaming protocols (OpenAI SSE with `data:` frames, Anthropic event-typed SSE, Google's chunked JSON). The multiplexer normalizes all of them into a single `AsyncGenerator<StreamChunk>` interface, with backpressure so a slow consumer doesn't blow up memory.
 
 ### Cost Engine
-- Real-time cost calculation per request (input + output tokens)
-- Budget enforcement with soft/hard limits
-- Cost forecasting based on historical usage patterns
-- Per-tenant, per-model, and per-endpoint cost attribution
 
-### Observability (OpenTelemetry Native)
-- Distributed traces spanning full request lifecycle
-- Metrics: latency histograms, token throughput, error rates, cost
-- Structured JSON logging with correlation IDs
-- Custom spans for routing decisions and circuit breaker transitions
+Every request is priced at completion using a per-model pricing registry (input and output tokens billed separately). Budgets can be enforced daily and monthly with soft-warning and hard-block thresholds. Cost is attributable per tenant, per model, and per endpoint.
+
+### Observability
+
+OpenTelemetry-native. Traces span the full request lifecycle including routing decisions and circuit breaker transitions as discrete spans, so you can see exactly *why* a request went to a given provider.
 
 ## Installation
 
@@ -115,6 +120,7 @@ const gateway = new InferenceGateway({
         failureThreshold: 5,
         recoveryTimeout: 30_000,
         successThreshold: 3,
+        monitorWindow: 60_000,
       },
     },
     {
@@ -132,7 +138,7 @@ const gateway = new InferenceGateway({
     },
   ],
   routing: {
-    strategy: 'cost-optimized', // 'round-robin' | 'least-latency' | 'cost-optimized'
+    strategy: 'cost-optimized',
     fallbackChain: ['openai', 'anthropic', 'groq'],
   },
   budget: {
@@ -149,19 +155,36 @@ const gateway = new InferenceGateway({
 // Non-streaming
 const response = await gateway.complete({
   messages: [{ role: 'user', content: 'Explain quantum computing' }],
-  model: 'auto', // Let the router decide
+  model: 'auto',
   maxTokens: 1024,
 });
 
+console.log(response.provider);   // Which provider handled it
+console.log(response.cost.total); // USD cost of this call
+console.log(response.latency);    // Milliseconds
+
 // Streaming
-const stream = gateway.stream({
+for await (const chunk of gateway.stream({
   messages: [{ role: 'user', content: 'Write a poem' }],
   model: 'auto',
-});
-
-for await (const chunk of stream) {
+})) {
   process.stdout.write(chunk.delta);
 }
+```
+
+### Observing Provider Health
+
+```typescript
+gateway.on('circuit:open', ({ provider, failures }) => {
+  console.warn(`${provider} circuit opened after ${failures} failures`);
+});
+
+gateway.on('budget:warning', ({ usage, limit, period }) => {
+  console.warn(`${period} budget at ${((usage / limit) * 100).toFixed(0)}%`);
+});
+
+const health = gateway.getProviderHealth();
+// { openai: { state: 'CLOSED', failures: 0, latencyP95: 842 }, ... }
 ```
 
 ## Configuration
@@ -172,7 +195,6 @@ interface GatewayConfig {
   routing: RoutingConfig;
   budget?: BudgetConfig;
   telemetry?: TelemetryConfig;
-  middleware?: MiddlewareConfig[];
   retry?: RetryConfig;
 }
 
@@ -189,10 +211,10 @@ interface ProviderConfig {
 }
 
 interface CircuitBreakerConfig {
-  failureThreshold: number;    // Failures before opening
-  recoveryTimeout: number;     // Ms before half-open
-  successThreshold: number;    // Successes to close
-  monitorWindow: number;       // Rolling window size
+  failureThreshold: number;  // Failures before opening
+  recoveryTimeout: number;   // Ms before attempting HALF_OPEN
+  successThreshold: number;  // Consecutive successes to close
+  monitorWindow: number;     // Rolling window for failure counting
 }
 ```
 
@@ -201,57 +223,62 @@ interface CircuitBreakerConfig {
 ```
 src/
 ├── core/
-│   ├── gateway.ts              # Main gateway orchestrator
+│   ├── gateway.ts              # Main orchestrator + event emitter
 │   ├── router.ts               # Routing strategy engine
-│   └── config.ts               # Configuration validation (Zod)
+│   └── config.ts               # Zod configuration schemas
 ├── providers/
 │   ├── base.provider.ts        # Abstract provider interface
-│   ├── openai.provider.ts      # OpenAI implementation
-│   ├── anthropic.provider.ts   # Anthropic implementation
-│   ├── google.provider.ts      # Google Gemini implementation
-│   └── groq.provider.ts        # Groq implementation
+│   ├── openai.provider.ts
+│   ├── anthropic.provider.ts
+│   ├── google.provider.ts
+│   └── groq.provider.ts
 ├── resilience/
-│   ├── circuit-breaker.ts      # Circuit breaker state machine
+│   ├── circuit-breaker.ts      # Three-state machine
 │   ├── retry.ts                # Exponential backoff with jitter
-│   ├── timeout.ts              # Request timeout management
+│   ├── timeout.ts              # Deadline propagation
 │   └── bulkhead.ts             # Concurrency isolation
 ├── streaming/
-│   ├── multiplexer.ts          # Stream protocol adapter
+│   ├── multiplexer.ts          # Protocol normalization
 │   ├── backpressure.ts         # Flow control
-│   └── accumulator.ts          # Token counting & buffering
+│   └── accumulator.ts          # Token counting + buffering
 ├── cost/
-│   ├── calculator.ts           # Per-request cost computation
-│   ├── budget.ts               # Budget enforcement
+│   ├── calculator.ts           # Per-request pricing
+│   ├── budget.ts               # Enforcement + alerts
 │   └── pricing.ts              # Model pricing registry
 ├── telemetry/
-│   ├── tracer.ts               # OpenTelemetry trace setup
+│   ├── tracer.ts               # OTel trace setup
 │   ├── metrics.ts              # Prometheus-compatible metrics
 │   └── logger.ts               # Structured logging (Pino)
-├── middleware/
-│   ├── auth.ts                 # API key / JWT validation
-│   ├── rate-limiter.ts         # Per-client rate limiting
-│   └── request-validator.ts    # Input schema validation
-└── index.ts                    # Public API exports
+└── index.ts
 ```
 
-## Benchmarks
+## Performance Targets
 
-| Metric | Value |
-|--------|-------|
-| Routing decision latency | < 2ms P99 |
-| Streaming first-byte overhead | < 5ms |
-| Circuit breaker state transition | < 1ms |
-| Memory per active connection | ~2.4 KB |
-| Max concurrent streams | 10,000+ |
+These are **design goals** for the implementation, not measured benchmarks. A reproducible benchmark suite is on the roadmap.
+
+| Metric | Target |
+|--------|--------|
+| Routing decision overhead | Sub-millisecond (pure in-memory scoring) |
+| Streaming first-byte overhead | Negligible vs. direct provider call |
+| Circuit breaker evaluation | O(1) amortized, no allocations on hot path |
+| Memory per active stream | Bounded by configured buffer size |
+
+## Design Decisions
+
+**Why rolling-window failure counting?** A fixed counter never resets, so a provider that failed 5 times over a week would stay permanently open. The rolling window means only recent failures count toward the threshold.
+
+**Why fail HALF_OPEN on a single error?** Half-open exists to probe recovery. If the probe fails, the provider is still unhealthy, and letting more traffic through would just produce more user-facing errors.
+
+**Why rank-based cost scoring instead of absolute price?** Absolute prices change per provider announcement. Ranking is stable and lets you swap the pricing registry without retuning routing weights.
 
 ## Roadmap
 
-- [ ] Adaptive routing with reinforcement learning
-- [ ] Response caching with semantic similarity
+- [ ] Complete provider adapters (OpenAI, Anthropic, Google, Groq)
+- [ ] Reproducible benchmark suite with published methodology
+- [ ] Semantic response caching
+- [ ] Adaptive routing (learn provider performance over time)
 - [ ] Multi-region provider pools
-- [ ] WebSocket provider support (real-time APIs)
-- [ ] Plugin system for custom routing strategies
-- [ ] Dashboard UI for monitoring and configuration
+- [ ] Plugin API for custom routing strategies
 
 ## License
 
