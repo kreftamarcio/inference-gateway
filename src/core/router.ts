@@ -1,5 +1,6 @@
 import type { CircuitBreaker } from '../resilience/circuit-breaker.js';
 import type { CostCalculator } from '../cost/calculator.js';
+import type { ProviderAdapter, ProviderRequest } from './config.js';
 
 export type RoutingStrategy = 'round-robin' | 'least-latency' | 'cost-optimized' | 'capability-based';
 
@@ -20,8 +21,8 @@ export interface ProviderInstance {
   name: string;
   models: string[];
   weight: number;
-  complete: (request: unknown) => Promise<unknown>;
-  stream: (request: unknown) => Promise<AsyncIterable<unknown>>;
+  complete: ProviderAdapter['complete'];
+  stream: ProviderAdapter['stream'];
 }
 
 interface LatencyRecord {
@@ -38,6 +39,7 @@ export class Router {
     private readonly config: RoutingConfig,
     private readonly circuitBreakers: Map<string, CircuitBreaker>,
     private readonly costCalculator: CostCalculator,
+    private readonly providers: Map<string, ProviderInstance>,
   ) {}
 
   async selectProvider(request: { model?: string; messages?: unknown[] }): Promise<ProviderSelection> {
@@ -47,17 +49,13 @@ export class Router {
       throw new NoHealthyProviderError('All providers are unavailable');
     }
 
-    // If specific model requested, find the provider that has it
     if (request.model && request.model !== 'auto') {
-      const match = availableProviders.find(p =>
-        p.models.includes(request.model!),
-      );
+      const match = availableProviders.find((p) => p.models.includes(request.model!));
       if (match) {
         return { provider: match, model: request.model, reason: 'explicit-model' };
       }
     }
 
-    // Apply routing strategy
     switch (this.config.strategy) {
       case 'round-robin':
         return this.roundRobin(availableProviders);
@@ -66,7 +64,7 @@ export class Router {
       case 'cost-optimized':
         return this.costOptimized(availableProviders);
       case 'capability-based':
-        return this.capabilityBased(availableProviders, request);
+        return this.capabilityBased(availableProviders);
       default:
         return this.roundRobin(availableProviders);
     }
@@ -99,31 +97,30 @@ export class Router {
     const healthy: ProviderInstance[] = [];
 
     for (const [name, breaker] of this.circuitBreakers) {
-      if (breaker.getState() !== 'OPEN') {
-        // Provider is available (CLOSED or HALF_OPEN)
-        // In production, this would reference actual provider instances
-        healthy.push({
-          name,
-          models: [],
-          weight: 1,
-          complete: async () => ({}),
-          stream: async () => (async function* () {})(),
-        });
+      if (breaker.getState() === 'OPEN') continue;
+
+      const instance = this.providers.get(name);
+      if (!instance) {
+        throw new Error(
+          `Circuit breaker registered for "${name}" but no provider instance was supplied. ` +
+            'The router no longer invents stub adapters.',
+        );
       }
+
+      healthy.push(instance);
     }
 
     return healthy;
   }
 
   private roundRobin(providers: ProviderInstance[]): ProviderSelection {
-    // Weighted round-robin
-    const totalWeight = providers.reduce((sum, p) => sum + p.weight, 0);
     this.roundRobinIndex = (this.roundRobinIndex + 1) % providers.length;
-
     const selected = providers[this.roundRobinIndex]!;
-    const model = selected.models[0] ?? 'default';
-
-    return { provider: selected, model, reason: 'round-robin' };
+    return {
+      provider: selected,
+      model: selected.models[0] ?? 'default',
+      reason: 'round-robin',
+    };
   }
 
   private leastLatency(providers: ProviderInstance[]): ProviderSelection {
@@ -146,28 +143,26 @@ export class Router {
   }
 
   private costOptimized(providers: ProviderInstance[]): ProviderSelection {
-    const cheapest = this.costCalculator.getCheapestModel(
-      providers.map(p => p.name),
-    );
+    const cheapest = this.costCalculator.getCheapestModel(providers.map((p) => p.name));
 
     if (cheapest) {
-      const provider = providers.find(p => p.name === cheapest.provider)!;
-      return {
-        provider,
-        model: cheapest.model,
-        reason: `cost-optimized ($${cheapest.pricing.inputPerMillion}/M input)`,
-      };
+      const provider = providers.find((p) => p.name === cheapest.provider);
+      if (provider) {
+        const model = provider.models.includes(cheapest.model)
+          ? cheapest.model
+          : (provider.models[0] ?? cheapest.model);
+        return {
+          provider,
+          model,
+          reason: `cost-optimized ($${cheapest.pricing.inputPerMillion}/M input)`,
+        };
+      }
     }
 
     return this.roundRobin(providers);
   }
 
-  private capabilityBased(
-    providers: ProviderInstance[],
-    _request: { model?: string; messages?: unknown[] },
-  ): ProviderSelection {
-    // Default to first available for now
-    // In production: analyze request for vision/tools/long-context needs
+  private capabilityBased(providers: ProviderInstance[]): ProviderSelection {
     const selected = providers[0]!;
     return {
       provider: selected,
@@ -185,3 +180,5 @@ export class NoHealthyProviderError extends Error {
     this.name = 'NoHealthyProviderError';
   }
 }
+
+export type { ProviderRequest };

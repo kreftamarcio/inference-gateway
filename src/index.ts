@@ -12,8 +12,20 @@ export type {
   CompletionResponse,
 } from './core/gateway.js';
 
+export type {
+  GatewayConfig,
+  ProviderConfig,
+  ProviderAdapter,
+  ProviderRequest,
+  ProviderCompleteResult,
+} from './core/config.js';
+
 export { Router, NoHealthyProviderError } from './core/router.js';
 export type { RoutingStrategy, RoutingConfig, ProviderSelection } from './core/router.js';
+
+// Providers
+export { MockProvider } from './providers/mock.js';
+export type { MockProviderOptions } from './providers/mock.js';
 
 // Resilience
 export { CircuitBreaker, CircuitOpenError } from './resilience/circuit-breaker.js';
@@ -39,11 +51,6 @@ export type { TimeoutConfig, Deadline } from './resilience/timeout.js';
 export { Bulkhead, BulkheadFullError, BulkheadTimeoutError } from './resilience/bulkhead.js';
 export type { BulkheadConfig, BulkheadMetrics } from './resilience/bulkhead.js';
 
-// Streaming
-//
-// StreamError is exported because pipe() throws it on upstream failure and on idle
-// timeout. Without the class, a caller cannot narrow on `error.code` and is forced to
-// match on the message string, which breaks the moment the wording changes.
 export { StreamMultiplexer, StreamError } from './streaming/multiplexer.js';
 export type {
   StreamChunk,
