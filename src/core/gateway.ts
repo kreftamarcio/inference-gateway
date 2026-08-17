@@ -1,6 +1,6 @@
 import { EventEmitter } from 'eventemitter3';
-import type { GatewayConfig } from './config.js';
-import { Router } from './router.js';
+import type { GatewayConfig, ProviderRequest } from './config.js';
+import { Router, type ProviderInstance } from './router.js';
 import { CircuitBreaker } from '../resilience/circuit-breaker.js';
 import { CostCalculator } from '../cost/calculator.js';
 import { BudgetGuard } from '../cost/budget.js';
@@ -8,10 +8,6 @@ import { StreamMultiplexer, type StreamChunk } from '../streaming/multiplexer.js
 import { Tracer } from '../telemetry/tracer.js';
 import { Logger } from '../telemetry/logger.js';
 
-// Re-exported rather than redeclared. This file previously defined its own
-// StreamChunk that omitted 'content_filter' and 'error' from the finish-reason union
-// and used a different usage shape, so the same contract had two incompatible
-// definitions and index.ts was exporting both.
 export type { StreamChunk };
 
 export interface CompletionRequest {
@@ -80,6 +76,8 @@ export class InferenceGateway extends EventEmitter<GatewayEvents> {
     this.multiplexer = new StreamMultiplexer();
 
     this.circuitBreakers = new Map();
+    const instances = new Map<string, ProviderInstance>();
+
     for (const provider of config.providers) {
       this.circuitBreakers.set(
         provider.name,
@@ -92,9 +90,17 @@ export class InferenceGateway extends EventEmitter<GatewayEvents> {
           },
         ),
       );
+
+      instances.set(provider.name, {
+        name: provider.name,
+        models: provider.models,
+        weight: provider.weight ?? 1,
+        complete: (request) => provider.adapter.complete(request),
+        stream: (request) => provider.adapter.stream(request),
+      });
     }
 
-    this.router = new Router(config.routing, this.circuitBreakers, this.costCalculator);
+    this.router = new Router(config.routing, this.circuitBreakers, this.costCalculator, instances);
     this.logger.info('Gateway initialized', {
       providers: config.providers.map((p) => p.name),
     });
@@ -103,16 +109,9 @@ export class InferenceGateway extends EventEmitter<GatewayEvents> {
   async complete(request: CompletionRequest): Promise<CompletionResponse> {
     const requestId = crypto.randomUUID();
     const span = this.tracer.startSpan('gateway.complete', { requestId });
-
-    // Declared outside the try so the catch can attribute a failure to the provider
-    // that was actually selected. It previously always reported 'unknown', which made
-    // a trace unable to answer "which provider failed?".
     let providerName = 'unrouted';
 
     try {
-      // Checked BEFORE routing and inference. Checking afterwards means every run
-      // exceeds its ceiling by one call, and inference is the most expensive operation
-      // in the system.
       await this.budgetGuard.assertWithinBudget(request.tenantId);
 
       const selected = await this.router.selectProvider(request);
@@ -125,12 +124,12 @@ export class InferenceGateway extends EventEmitter<GatewayEvents> {
 
       const breaker = this.breakerFor(providerName);
       const startTime = performance.now();
+      const providerRequest = this.toProviderRequest(request, selected.model);
 
-      const result = await breaker.execute(async () =>
-        selected.provider.complete({ ...request, model: selected.model }),
-      );
+      const result = await breaker.execute(async () => selected.provider.complete(providerRequest));
 
       const latency = performance.now() - startTime;
+      this.router.recordLatency(providerName, latency);
       const cost = this.costCalculator.calculate(providerName, selected.model, result.usage);
 
       const response: CompletionResponse = {
@@ -162,14 +161,6 @@ export class InferenceGateway extends EventEmitter<GatewayEvents> {
     }
   }
 
-  /**
-   * Stream a completion.
-   *
-   * Enforces the same budget and records the same cost as complete(). Both were missing
-   * here: a budget-exhausted caller was blocked on buffered calls and served on
-   * streamed ones, and streamed tokens never reached recordUsage, so a streaming
-   * workload could exceed a monthly ceiling without ever tripping it.
-   */
   async *stream(request: CompletionRequest): AsyncGenerator<StreamChunk> {
     const requestId = crypto.randomUUID();
     const span = this.tracer.startSpan('gateway.stream', { requestId });
@@ -190,13 +181,9 @@ export class InferenceGateway extends EventEmitter<GatewayEvents> {
       this.emit('request:start', { requestId, provider: providerName, model });
 
       const breaker = this.breakerFor(providerName);
-      const providerStream = await breaker.execute(async () =>
-        selected.provider.stream({ ...request, model }),
-      );
+      const providerRequest = this.toProviderRequest(request, model);
+      const providerStream = await breaker.execute(async () => selected.provider.stream(providerRequest));
 
-      // Usage accumulates across chunks rather than being read from the last one:
-      // providers report input and output token counts in different frames, so
-      // reading a single chunk yields half the total.
       let usage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
       let chunkCount = 0;
       let timeToFirstTokenMs: number | null = null;
@@ -227,6 +214,7 @@ export class InferenceGateway extends EventEmitter<GatewayEvents> {
 
       const cost = this.costCalculator.calculate(providerName, model, usage);
       await this.budgetGuard.recordUsage(cost.total, request.tenantId);
+      this.router.recordLatency(providerName, totalDurationMs);
 
       this.emit('stream:complete', {
         requestId,
@@ -274,14 +262,15 @@ export class InferenceGateway extends EventEmitter<GatewayEvents> {
     return this.budgetGuard.getUsageSummary(tenantId);
   }
 
-  /**
-   * Look up a breaker, throwing a diagnosable error when absent.
-   *
-   * This replaces two non-null assertions. They were safe only because the map is built
-   * from the same provider list the router selects from, which is an invariant no type
-   * expresses: any future code path that returns a provider not in config would produce
-   * "cannot read property of undefined" with no indication of why.
-   */
+  private toProviderRequest(request: CompletionRequest, model: string): ProviderRequest {
+    return {
+      messages: request.messages,
+      model,
+      ...(request.maxTokens !== undefined ? { maxTokens: request.maxTokens } : {}),
+      ...(request.temperature !== undefined ? { temperature: request.temperature } : {}),
+    };
+  }
+
   private breakerFor(providerName: string): CircuitBreaker {
     const breaker = this.circuitBreakers.get(providerName);
 
@@ -304,8 +293,14 @@ export class InferenceGateway extends EventEmitter<GatewayEvents> {
 
     for (const provider of config.providers) {
       if (!provider.apiKey) {
-        // The provider name is safe to include; the key value never is.
         throw new Error(`API key required for provider: ${provider.name}`);
+      }
+
+      if (!provider.adapter) {
+        throw new Error(
+          `Provider "${provider.name}" is missing an adapter. Inject MockProvider ` +
+            'or a real provider adapter; the gateway does not invent HTTP clients.',
+        );
       }
 
       if (seen.has(provider.name)) {
